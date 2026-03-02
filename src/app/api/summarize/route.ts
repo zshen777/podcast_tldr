@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { YoutubeTranscript } from "youtube-transcript";
+import { Innertube } from "youtubei.js";
 import Anthropic from "@anthropic-ai/sdk";
 
 function extractVideoId(url: string): string | null {
@@ -14,6 +14,31 @@ function extractVideoId(url: string): string | null {
     if (match) return match[1];
   }
   return null;
+}
+
+async function fetchTranscript(videoId: string): Promise<string> {
+  const innertube = await Innertube.create();
+  const videoInfo = await innertube.getInfo(videoId);
+  const transcriptInfo = await videoInfo.getTranscript();
+
+  const segments =
+    transcriptInfo.transcript.content?.body?.initial_segments || [];
+
+  const text = segments
+    .map((segment) => {
+      // Each segment has a .snippet Text object
+      const snippetText =
+        "snippet" in segment ? String(segment.snippet) : "";
+      return snippetText;
+    })
+    .filter(Boolean)
+    .join(" ");
+
+  if (!text.trim()) {
+    throw new Error("Transcript is empty");
+  }
+
+  return text;
 }
 
 const SYSTEM_PROMPT = `You are an expert podcast and video summarizer. Your job is to create a concise, well-structured TLDR summary that someone can read in 2-3 minutes over their morning coffee.
@@ -58,44 +83,44 @@ export async function POST(request: NextRequest) {
     const videoId = extractVideoId(url);
     if (!videoId) {
       return NextResponse.json(
-        { error: "Could not extract video ID from the URL. Please provide a valid YouTube URL." },
+        {
+          error:
+            "Could not extract video ID from the URL. Please provide a valid YouTube URL.",
+        },
         { status: 400 }
       );
     }
 
     // Fetch transcript
-    let transcriptItems;
+    let fullTranscript: string;
     try {
-      transcriptItems = await YoutubeTranscript.fetchTranscript(videoId);
-    } catch {
+      fullTranscript = await fetchTranscript(videoId);
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : "Unknown error";
       return NextResponse.json(
-        { error: "Could not fetch transcript. The video may not have captions available, or the URL may be invalid." },
+        {
+          error: `Could not fetch transcript: ${detail}. The video may not have captions available.`,
+        },
         { status: 422 }
       );
     }
-
-    if (!transcriptItems || transcriptItems.length === 0) {
-      return NextResponse.json(
-        { error: "No transcript found for this video." },
-        { status: 422 }
-      );
-    }
-
-    const fullTranscript = transcriptItems
-      .map((item) => item.text)
-      .join(" ");
 
     // Truncate very long transcripts to stay within context limits
     const maxChars = 100_000;
     const transcript =
       fullTranscript.length > maxChars
-        ? fullTranscript.slice(0, maxChars) + "\n\n[Transcript truncated due to length]"
+        ? fullTranscript.slice(0, maxChars) +
+          "\n\n[Transcript truncated due to length]"
         : fullTranscript;
 
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) {
       return NextResponse.json(
-        { error: "Anthropic API key not configured. Please set ANTHROPIC_API_KEY in your .env.local file." },
+        {
+          error:
+            "Anthropic API key not configured. Please set ANTHROPIC_API_KEY in your .env.local file.",
+        },
         { status: 500 }
       );
     }
@@ -124,7 +149,8 @@ export async function POST(request: NextRequest) {
               event.type === "content_block_delta" &&
               event.delta.type === "text_delta"
             ) {
-              const chunk = JSON.stringify({ text: event.delta.text }) + "\n";
+              const chunk =
+                JSON.stringify({ text: event.delta.text }) + "\n";
               controller.enqueue(encoder.encode(chunk));
             }
           }
@@ -132,7 +158,9 @@ export async function POST(request: NextRequest) {
           controller.close();
         } catch (err) {
           const message =
-            err instanceof Error ? err.message : "Failed to generate summary";
+            err instanceof Error
+              ? err.message
+              : "Failed to generate summary";
           controller.enqueue(
             encoder.encode(JSON.stringify({ error: message }) + "\n")
           );
