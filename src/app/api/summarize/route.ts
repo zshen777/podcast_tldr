@@ -86,6 +86,119 @@ function parseXmlTranscript(xml: string): string {
 // Collect diagnostic info for debugging failures
 const diagnostics: string[] = [];
 
+// Strategy 0 (Primary): Use Invidious API instances to fetch captions.
+// These are open-source YouTube frontends that run on servers designed
+// to handle YouTube's datacenter IP blocking.
+const INVIDIOUS_INSTANCES = [
+  "https://inv.nadeko.net",
+  "https://invidious.nerdvpn.de",
+  "https://invidious.projectsegfau.lt",
+  "https://vid.puffyan.us",
+  "https://invidious.privacyredirect.com",
+  "https://iv.nbofc.de",
+];
+
+async function fetchTranscriptViaInvidious(
+  videoId: string
+): Promise<string | null> {
+  for (const instance of INVIDIOUS_INSTANCES) {
+    try {
+      // First, get the list of available caption tracks
+      const captionsRes = await fetch(
+        `${instance}/api/v1/captions/${videoId}`,
+        {
+          headers: { Accept: "application/json" },
+          signal: AbortSignal.timeout(10000),
+        }
+      );
+
+      if (!captionsRes.ok) {
+        diagnostics.push(
+          `Invidious ${instance}: captions list HTTP ${captionsRes.status}`
+        );
+        continue;
+      }
+
+      const captionsData = await captionsRes.json();
+      const tracks = captionsData?.captions || [];
+
+      if (!tracks.length) {
+        diagnostics.push(`Invidious ${instance}: no caption tracks`);
+        continue;
+      }
+
+      // Find English track, or fall back to first available
+      const enTrack = tracks.find(
+        (t: { language_code?: string; languageCode?: string }) => {
+          const code = t.language_code || t.languageCode || "";
+          return code === "en" || code.startsWith("en");
+        }
+      );
+      const track = enTrack || tracks[0];
+      const captionUrl = track.url;
+
+      if (!captionUrl) {
+        diagnostics.push(`Invidious ${instance}: track has no URL`);
+        continue;
+      }
+
+      // The URL may be relative to the instance or absolute
+      const fullUrl = captionUrl.startsWith("http")
+        ? captionUrl
+        : `${instance}${captionUrl}`;
+
+      const xmlRes = await fetch(fullUrl, {
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (!xmlRes.ok) {
+        diagnostics.push(
+          `Invidious ${instance}: caption fetch HTTP ${xmlRes.status}`
+        );
+        continue;
+      }
+
+      const xml = await xmlRes.text();
+      if (!xml.includes("<text") && !xml.includes("<body>")) {
+        // Might be JSON format from some instances
+        try {
+          const jsonData = JSON.parse(xml);
+          if (Array.isArray(jsonData)) {
+            const text = jsonData
+              .map(
+                (seg: { text?: string; utf8?: string }) =>
+                  seg.text || seg.utf8 || ""
+              )
+              .filter(Boolean)
+              .join(" ");
+            if (text.trim()) {
+              diagnostics.push(
+                `Invidious ${instance}: success (JSON, ${text.length} chars)`
+              );
+              return text;
+            }
+          }
+        } catch {
+          // not JSON either
+        }
+        diagnostics.push(
+          `Invidious ${instance}: response not recognized format`
+        );
+        continue;
+      }
+
+      diagnostics.push(`Invidious ${instance}: success`);
+      return parseXmlTranscript(xml);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "unknown";
+      diagnostics.push(`Invidious ${instance}: ${msg}`);
+      continue;
+    }
+  }
+
+  return null;
+}
+
 // Strategy A: Extract transcript params from ytInitialData on the watch page,
 // then call the get_transcript innertube endpoint.
 // This bypasses the player response entirely.
@@ -454,6 +567,10 @@ async function fetchTranscriptViaInnertube(
 
 async function fetchTranscript(videoId: string): Promise<string> {
   diagnostics.length = 0;
+
+  // Strategy 0 (Primary): Invidious API - most reliable from datacenter IPs
+  const fromInvidious = await fetchTranscriptViaInvidious(videoId);
+  if (fromInvidious) return fromInvidious;
 
   // Strategy A: Watch page -> ytInitialData -> get_transcript endpoint
   const fromWatchPage = await fetchTranscriptViaWatchPage(videoId);
