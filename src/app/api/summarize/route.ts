@@ -15,24 +15,6 @@ function extractVideoId(url: string): string | null {
   return null;
 }
 
-function extractJsonObject(html: string, marker: string): string | null {
-  const markerIdx = html.indexOf(marker);
-  if (markerIdx === -1) return null;
-
-  const startIdx = markerIdx + marker.length;
-  let braceCount = 0;
-  let endIdx = startIdx;
-  for (let i = startIdx; i < html.length; i++) {
-    if (html[i] === "{") braceCount++;
-    if (html[i] === "}") braceCount--;
-    if (braceCount === 0) {
-      endIdx = i + 1;
-      break;
-    }
-  }
-  return html.slice(startIdx, endIdx);
-}
-
 function decodeHtmlEntities(text: string): string {
   return text
     .replace(/&amp;/g, "&")
@@ -47,43 +29,69 @@ function decodeHtmlEntities(text: string): string {
     });
 }
 
-async function fetchYouTubePageHtml(videoId: string): Promise<string> {
-  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const res = await fetch(watchUrl, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to fetch YouTube page (status ${res.status})`);
-  }
-
-  return res.text();
+interface PlayerResponse {
+  captions?: {
+    playerCaptionsTracklistRenderer?: {
+      captionTracks?: Array<{
+        baseUrl: string;
+        languageCode: string;
+      }>;
+    };
+  };
+  streamingData?: {
+    adaptiveFormats?: Array<{
+      mimeType?: string;
+      url?: string;
+    }>;
+  };
+  playabilityStatus?: {
+    status?: string;
+    reason?: string;
+  };
 }
 
-function tryExtractCaptionsTranscript(html: string): string | null {
-  const captionsJson = extractJsonObject(html, '"captions":');
-  if (!captionsJson) return null;
+async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
+  // Use YouTube's innertube player API directly — much more reliable
+  // from server/serverless environments than scraping the watch page
+  const res = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "WEB",
+            clientVersion: "2.20240313.05.00",
+            hl: "en",
+            gl: "US",
+          },
+        },
+      }),
+    }
+  );
 
-  try {
-    const captions = JSON.parse(captionsJson);
-    const tracks =
-      captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-    if (!tracks || tracks.length === 0) return null;
-
-    const englishTrack = tracks.find(
-      (t: { languageCode: string }) =>
-        t.languageCode === "en" || t.languageCode?.startsWith("en")
-    );
-    const track = englishTrack || tracks[0];
-    return track.baseUrl || null;
-  } catch {
-    return null;
+  if (!res.ok) {
+    throw new Error(`YouTube player API returned status ${res.status}`);
   }
+
+  return res.json();
+}
+
+function extractCaptionUrl(player: PlayerResponse): string | null {
+  const tracks =
+    player.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks || tracks.length === 0) return null;
+
+  const englishTrack = tracks.find(
+    (t) => t.languageCode === "en" || t.languageCode?.startsWith("en")
+  );
+  return (englishTrack || tracks[0]).baseUrl || null;
 }
 
 async function fetchCaptionsFromUrl(captionUrl: string): Promise<string> {
@@ -113,22 +121,14 @@ async function fetchCaptionsFromUrl(captionUrl: string): Promise<string> {
   return text;
 }
 
-function extractAudioStreamUrl(html: string): string | null {
-  // Extract adaptiveFormats from YouTube's player response
-  const playerMatch = html.match(/"adaptiveFormats":\s*(\[[\s\S]*?\])/);
-  if (!playerMatch) return null;
+function extractAudioStreamUrl(player: PlayerResponse): string | null {
+  const formats = player.streamingData?.adaptiveFormats;
+  if (!formats) return null;
 
-  try {
-    const formats = JSON.parse(playerMatch[1]);
-    // Find an audio-only format (prefer mp4a/webm audio)
-    const audioFormat = formats.find(
-      (f: { mimeType?: string; url?: string }) =>
-        f.mimeType?.startsWith("audio/") && f.url
-    );
-    return audioFormat?.url || null;
-  } catch {
-    return null;
-  }
+  const audioFormat = formats.find(
+    (f) => f.mimeType?.startsWith("audio/") && f.url
+  );
+  return audioFormat?.url || null;
 }
 
 async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
@@ -189,10 +189,20 @@ async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
 }
 
 async function fetchTranscript(videoId: string): Promise<string> {
-  const html = await fetchYouTubePageHtml(videoId);
+  const player = await fetchPlayerData(videoId);
+
+  // Check if video is playable
+  if (
+    player.playabilityStatus?.status === "ERROR" ||
+    player.playabilityStatus?.status === "UNPLAYABLE"
+  ) {
+    throw new Error(
+      player.playabilityStatus.reason || "Video is not available"
+    );
+  }
 
   // Strategy 1: Try YouTube's existing captions (fast, free)
-  const captionUrl = tryExtractCaptionsTranscript(html);
+  const captionUrl = extractCaptionUrl(player);
   if (captionUrl) {
     try {
       return await fetchCaptionsFromUrl(captionUrl);
@@ -202,7 +212,7 @@ async function fetchTranscript(videoId: string): Promise<string> {
   }
 
   // Strategy 2: Extract audio stream URL and transcribe with AssemblyAI
-  const audioUrl = extractAudioStreamUrl(html);
+  const audioUrl = extractAudioStreamUrl(player);
   if (!audioUrl) {
     throw new Error(
       "Could not find captions or audio stream for this video"
