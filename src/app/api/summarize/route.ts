@@ -50,8 +50,46 @@ interface PlayerResponse {
   };
 }
 
+// Extract a JSON object from a string starting at the first { after marker
+function extractJsonFromString(text: string, marker: string): string | null {
+  const markerIdx = text.indexOf(marker);
+  if (markerIdx === -1) return null;
+
+  // Find the first { after the marker
+  let startIdx = -1;
+  for (let i = markerIdx + marker.length; i < text.length; i++) {
+    if (text[i] === "{") {
+      startIdx = i;
+      break;
+    }
+  }
+  if (startIdx === -1) return null;
+
+  // Match braces to find the complete JSON object
+  let braceCount = 0;
+  for (let i = startIdx; i < text.length; i++) {
+    if (text[i] === "{") braceCount++;
+    if (text[i] === "}") braceCount--;
+    if (braceCount === 0) {
+      return text.slice(startIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+function hasUsefulData(data: PlayerResponse): boolean {
+  const hasCaptions =
+    (data.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length ??
+      0) > 0;
+  const hasStreaming =
+    (data.streamingData?.adaptiveFormats?.length ?? 0) > 0;
+  return hasCaptions || hasStreaming;
+}
+
+// Collect diagnostic info for debugging failures
+const diagnostics: string[] = [];
+
 // Strategy A: Fetch the watch page HTML with consent-bypass cookies
-// and extract the embedded ytInitialPlayerResponse
 async function fetchPlayerFromWatchPage(
   videoId: string
 ): Promise<PlayerResponse | null> {
@@ -69,28 +107,63 @@ async function fetchPlayerFromWatchPage(
       }
     );
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      diagnostics.push(`WatchPage: HTTP ${res.status}`);
+      return null;
+    }
 
     const html = await res.text();
+    diagnostics.push(`WatchPage: got ${html.length} chars`);
 
-    // Extract ytInitialPlayerResponse from the page
-    const match = html.match(
-      /var ytInitialPlayerResponse\s*=\s*(\{.+?\});/
-    );
-    if (match) {
-      return JSON.parse(match[1]);
+    // Check for consent/bot pages
+    if (
+      html.includes("consent.youtube.com") ||
+      html.includes("accounts.google.com")
+    ) {
+      diagnostics.push("WatchPage: consent/login redirect detected");
     }
 
-    // Alternative: look for it inside ytInitialData or script tags
-    const altMatch = html.match(
-      /ytInitialPlayerResponse\s*=\s*(\{.+?\});/
-    );
-    if (altMatch) {
-      return JSON.parse(altMatch[1]);
+    // Try to extract ytInitialPlayerResponse using brace-matching
+    const markers = [
+      "var ytInitialPlayerResponse =",
+      "ytInitialPlayerResponse =",
+    ];
+
+    for (const marker of markers) {
+      const jsonStr = extractJsonFromString(html, marker);
+      if (jsonStr) {
+        try {
+          const data: PlayerResponse = JSON.parse(jsonStr);
+          diagnostics.push(
+            `WatchPage: parsed ${marker} (captions: ${!!data.captions}, streaming: ${!!data.streamingData})`
+          );
+          if (hasUsefulData(data)) return data;
+        } catch (e) {
+          diagnostics.push(
+            `WatchPage: JSON parse failed for ${marker}: ${e instanceof Error ? e.message : "unknown"}`
+          );
+        }
+      }
     }
 
+    // Also look for captions data directly in the page
+    const captionsJson = extractJsonFromString(html, '"captions":');
+    if (captionsJson) {
+      try {
+        const captions = JSON.parse(captionsJson);
+        diagnostics.push("WatchPage: found inline captions object");
+        return { captions } as PlayerResponse;
+      } catch {
+        diagnostics.push("WatchPage: inline captions parse failed");
+      }
+    }
+
+    diagnostics.push("WatchPage: no player data found in HTML");
     return null;
-  } catch {
+  } catch (e) {
+    diagnostics.push(
+      `WatchPage: fetch error: ${e instanceof Error ? e.message : "unknown"}`
+    );
     return null;
   }
 }
@@ -143,22 +216,24 @@ async function fetchPlayerFromInnertubeApi(
         }
       );
 
-      if (!res.ok) continue;
+      if (!res.ok) {
+        diagnostics.push(
+          `Innertube ${clientConfig.clientName}: HTTP ${res.status}`
+        );
+        continue;
+      }
 
       const data: PlayerResponse = await res.json();
+      const status = data.playabilityStatus?.status || "unknown";
+      diagnostics.push(
+        `Innertube ${clientConfig.clientName}: status=${status}, captions=${!!data.captions}, streaming=${!!data.streamingData}`
+      );
 
-      // Check if we got useful data (captions or streaming data)
-      const hasCaptions =
-        (data.captions?.playerCaptionsTracklistRenderer?.captionTracks
-          ?.length ?? 0) > 0;
-      const hasStreaming =
-        (data.streamingData?.adaptiveFormats?.length ?? 0) > 0;
-
-      if (hasCaptions || hasStreaming) {
-        return data;
-      }
-    } catch {
-      continue;
+      if (hasUsefulData(data)) return data;
+    } catch (e) {
+      diagnostics.push(
+        `Innertube ${clientConfig.clientName}: error: ${e instanceof Error ? e.message : "unknown"}`
+      );
     }
   }
 
@@ -166,6 +241,8 @@ async function fetchPlayerFromInnertubeApi(
 }
 
 async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
+  diagnostics.length = 0;
+
   // Try watch page first (most reliable for getting captions)
   const fromPage = await fetchPlayerFromWatchPage(videoId);
   if (fromPage) return fromPage;
@@ -175,7 +252,8 @@ async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
   if (fromApi) return fromApi;
 
   throw new Error(
-    "Could not retrieve video data from YouTube. The video may be private, age-restricted, or unavailable."
+    "Could not retrieve video data from YouTube. Debug info: " +
+      diagnostics.join(" | ")
   );
 }
 
