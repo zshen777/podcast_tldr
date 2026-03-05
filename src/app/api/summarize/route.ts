@@ -29,33 +29,19 @@ function decodeHtmlEntities(text: string): string {
     });
 }
 
-interface PlayerResponse {
-  captions?: {
-    playerCaptionsTracklistRenderer?: {
-      captionTracks?: Array<{
-        baseUrl: string;
-        languageCode: string;
-      }>;
-    };
-  };
-  streamingData?: {
-    adaptiveFormats?: Array<{
-      mimeType?: string;
-      url?: string;
-    }>;
-  };
-  playabilityStatus?: {
-    status?: string;
-    reason?: string;
-  };
-}
+const YT_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "Accept-Language": "en-US,en;q=0.9",
+  Cookie:
+    "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnOlwY; CONSENT=PENDING+999",
+};
 
 // Extract a JSON object from a string starting at the first { after marker
-function extractJsonFromString(text: string, marker: string): string | null {
+function extractJsonObject(text: string, marker: string): string | null {
   const markerIdx = text.indexOf(marker);
   if (markerIdx === -1) return null;
 
-  // Find the first { after the marker
   let startIdx = -1;
   for (let i = markerIdx + marker.length; i < text.length; i++) {
     if (text[i] === "{") {
@@ -65,7 +51,6 @@ function extractJsonFromString(text: string, marker: string): string | null {
   }
   if (startIdx === -1) return null;
 
-  // Match braces to find the complete JSON object
   let braceCount = 0;
   for (let i = startIdx; i < text.length; i++) {
     if (text[i] === "{") braceCount++;
@@ -77,207 +62,10 @@ function extractJsonFromString(text: string, marker: string): string | null {
   return null;
 }
 
-function hasUsefulData(data: PlayerResponse): boolean {
-  const hasCaptions =
-    (data.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length ??
-      0) > 0;
-  const hasStreaming =
-    (data.streamingData?.adaptiveFormats?.length ?? 0) > 0;
-  return hasCaptions || hasStreaming;
-}
-
-// Collect diagnostic info for debugging failures
-const diagnostics: string[] = [];
-
-// Strategy A: Fetch the watch page HTML with consent-bypass cookies
-async function fetchPlayerFromWatchPage(
-  videoId: string
-): Promise<PlayerResponse | null> {
-  try {
-    const res = await fetch(
-      `https://www.youtube.com/watch?v=${videoId}&hl=en`,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          "Accept-Language": "en-US,en;q=0.9",
-          Cookie:
-            "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnOlwY; CONSENT=PENDING+999",
-        },
-      }
-    );
-
-    if (!res.ok) {
-      diagnostics.push(`WatchPage: HTTP ${res.status}`);
-      return null;
-    }
-
-    const html = await res.text();
-    diagnostics.push(`WatchPage: got ${html.length} chars`);
-
-    // Check for consent/bot pages
-    if (
-      html.includes("consent.youtube.com") ||
-      html.includes("accounts.google.com")
-    ) {
-      diagnostics.push("WatchPage: consent/login redirect detected");
-    }
-
-    // Try to extract ytInitialPlayerResponse using brace-matching
-    const markers = [
-      "var ytInitialPlayerResponse =",
-      "ytInitialPlayerResponse =",
-    ];
-
-    for (const marker of markers) {
-      const jsonStr = extractJsonFromString(html, marker);
-      if (jsonStr) {
-        try {
-          const data: PlayerResponse = JSON.parse(jsonStr);
-          diagnostics.push(
-            `WatchPage: parsed ${marker} (captions: ${!!data.captions}, streaming: ${!!data.streamingData})`
-          );
-          if (hasUsefulData(data)) return data;
-        } catch (e) {
-          diagnostics.push(
-            `WatchPage: JSON parse failed for ${marker}: ${e instanceof Error ? e.message : "unknown"}`
-          );
-        }
-      }
-    }
-
-    // Also look for captions data directly in the page
-    const captionsJson = extractJsonFromString(html, '"captions":');
-    if (captionsJson) {
-      try {
-        const captions = JSON.parse(captionsJson);
-        diagnostics.push("WatchPage: found inline captions object");
-        return { captions } as PlayerResponse;
-      } catch {
-        diagnostics.push("WatchPage: inline captions parse failed");
-      }
-    }
-
-    diagnostics.push("WatchPage: no player data found in HTML");
-    return null;
-  } catch (e) {
-    diagnostics.push(
-      `WatchPage: fetch error: ${e instanceof Error ? e.message : "unknown"}`
-    );
-    return null;
-  }
-}
-
-// Strategy B: Use innertube player API with different client types
-async function fetchPlayerFromInnertubeApi(
-  videoId: string
-): Promise<PlayerResponse | null> {
-  const clients = [
-    {
-      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-      clientVersion: "2.0",
-    },
-    {
-      clientName: "ANDROID",
-      clientVersion: "19.09.37",
-      androidSdkVersion: 30,
-    },
-    {
-      clientName: "IOS",
-      clientVersion: "19.09.3",
-    },
-    {
-      clientName: "WEB",
-      clientVersion: "2.20240313.05.00",
-    },
-  ];
-
-  for (const clientConfig of clients) {
-    try {
-      const res = await fetch(
-        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          },
-          body: JSON.stringify({
-            videoId,
-            context: {
-              client: {
-                ...clientConfig,
-                hl: "en",
-                gl: "US",
-              },
-            },
-          }),
-        }
-      );
-
-      if (!res.ok) {
-        diagnostics.push(
-          `Innertube ${clientConfig.clientName}: HTTP ${res.status}`
-        );
-        continue;
-      }
-
-      const data: PlayerResponse = await res.json();
-      const status = data.playabilityStatus?.status || "unknown";
-      diagnostics.push(
-        `Innertube ${clientConfig.clientName}: status=${status}, captions=${!!data.captions}, streaming=${!!data.streamingData}`
-      );
-
-      if (hasUsefulData(data)) return data;
-    } catch (e) {
-      diagnostics.push(
-        `Innertube ${clientConfig.clientName}: error: ${e instanceof Error ? e.message : "unknown"}`
-      );
-    }
-  }
-
-  return null;
-}
-
-async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
-  diagnostics.length = 0;
-
-  // Try watch page first (most reliable for getting captions)
-  const fromPage = await fetchPlayerFromWatchPage(videoId);
-  if (fromPage) return fromPage;
-
-  // Try innertube API with various clients
-  const fromApi = await fetchPlayerFromInnertubeApi(videoId);
-  if (fromApi) return fromApi;
-
-  throw new Error(
-    "Could not retrieve video data from YouTube. Debug info: " +
-      diagnostics.join(" | ")
-  );
-}
-
-function extractCaptionUrl(player: PlayerResponse): string | null {
-  const tracks =
-    player.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks || tracks.length === 0) return null;
-
-  const englishTrack = tracks.find(
-    (t) => t.languageCode === "en" || t.languageCode?.startsWith("en")
-  );
-  return (englishTrack || tracks[0]).baseUrl || null;
-}
-
-async function fetchCaptionsFromUrl(captionUrl: string): Promise<string> {
-  const captionRes = await fetch(captionUrl);
-  if (!captionRes.ok) {
-    throw new Error(`Failed to fetch captions (status ${captionRes.status})`);
-  }
-
-  const xml = await captionRes.text();
+function parseXmlTranscript(xml: string): string {
   const textSegments = xml.match(/<text[^>]*>([\s\S]*?)<\/text>/g);
   if (!textSegments || textSegments.length === 0) {
-    throw new Error("Transcript is empty");
+    throw new Error("Transcript XML is empty");
   }
 
   const text = textSegments
@@ -295,105 +83,393 @@ async function fetchCaptionsFromUrl(captionUrl: string): Promise<string> {
   return text;
 }
 
-function extractAudioStreamUrl(player: PlayerResponse): string | null {
-  const formats = player.streamingData?.adaptiveFormats;
-  if (!formats) return null;
+// Collect diagnostic info for debugging failures
+const diagnostics: string[] = [];
 
-  const audioFormat = formats.find(
-    (f) => f.mimeType?.startsWith("audio/") && f.url
-  );
-  return audioFormat?.url || null;
-}
-
-async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
-  const apiKey = process.env.ASSEMBLYAI_API_KEY;
-  if (!apiKey) {
-    throw new Error(
-      "No captions available and ASSEMBLYAI_API_KEY is not configured for audio transcription fallback."
+// Strategy A: Extract transcript params from ytInitialData on the watch page,
+// then call the get_transcript innertube endpoint.
+// This bypasses the player response entirely.
+async function fetchTranscriptViaWatchPage(
+  videoId: string
+): Promise<string | null> {
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/watch?v=${videoId}&hl=en`,
+      { headers: YT_HEADERS }
     );
-  }
 
-  // Submit transcription job
-  const submitRes = await fetch("https://api.assemblyai.com/v2/transcript", {
-    method: "POST",
-    headers: {
-      Authorization: apiKey,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ audio_url: audioUrl }),
-  });
-
-  if (!submitRes.ok) {
-    throw new Error(
-      `AssemblyAI submission failed (status ${submitRes.status})`
-    );
-  }
-
-  const { id } = await submitRes.json();
-
-  // Poll for completion (max ~5 minutes)
-  const pollUrl = `https://api.assemblyai.com/v2/transcript/${id}`;
-  const maxAttempts = 60;
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-
-    const pollRes = await fetch(pollUrl, {
-      headers: { Authorization: apiKey },
-    });
-
-    if (!pollRes.ok) continue;
-
-    const result = await pollRes.json();
-
-    if (result.status === "completed") {
-      if (!result.text?.trim()) {
-        throw new Error("Transcription returned empty text");
-      }
-      return result.text;
+    if (!res.ok) {
+      diagnostics.push(`WatchPage: HTTP ${res.status}`);
+      return null;
     }
 
-    if (result.status === "error") {
-      throw new Error(
-        `Transcription failed: ${result.error || "unknown error"}`
+    const html = await res.text();
+    diagnostics.push(`WatchPage: got ${html.length} chars`);
+
+    // First try to get caption URLs from ytInitialPlayerResponse
+    const playerJson = extractJsonObject(
+      html,
+      "var ytInitialPlayerResponse ="
+    );
+    if (playerJson) {
+      try {
+        const player = JSON.parse(playerJson);
+        const tracks =
+          player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+        if (tracks && tracks.length > 0) {
+          const enTrack = tracks.find(
+            (t: { languageCode: string }) =>
+              t.languageCode === "en" || t.languageCode?.startsWith("en")
+          );
+          const captionUrl = (enTrack || tracks[0]).baseUrl;
+          if (captionUrl) {
+            const captionRes = await fetch(captionUrl);
+            if (captionRes.ok) {
+              diagnostics.push("WatchPage: got captions from player response");
+              return parseXmlTranscript(await captionRes.text());
+            }
+          }
+        }
+        diagnostics.push(
+          `WatchPage: player parsed but no caption tracks`
+        );
+      } catch {
+        diagnostics.push("WatchPage: player JSON parse failed");
+      }
+    }
+
+    // Extract ytInitialData and find transcript engagement panel
+    const dataJson = extractJsonObject(html, "var ytInitialData =");
+    if (!dataJson) {
+      diagnostics.push("WatchPage: no ytInitialData found");
+      return null;
+    }
+
+    let initialData;
+    try {
+      initialData = JSON.parse(dataJson);
+    } catch {
+      diagnostics.push("WatchPage: ytInitialData parse failed");
+      return null;
+    }
+
+    // Navigate to engagement panels to find transcript params
+    const panels = initialData?.engagementPanels || [];
+    let transcriptParams: string | null = null;
+
+    for (const panel of panels) {
+      const renderer =
+        panel?.engagementPanelSectionListRenderer?.content
+          ?.continuationItemRenderer?.continuationEndpoint
+          ?.getTranscriptEndpoint?.params;
+      if (renderer) {
+        transcriptParams = renderer;
+        break;
+      }
+    }
+
+    // Also search in the full serialized JSON as a fallback
+    if (!transcriptParams) {
+      const jsonStr = JSON.stringify(initialData);
+      const paramMatch = jsonStr.match(
+        /"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"/
+      );
+      if (paramMatch) {
+        transcriptParams = paramMatch[1];
+      }
+    }
+
+    if (!transcriptParams) {
+      diagnostics.push("WatchPage: no transcript params in ytInitialData");
+      return null;
+    }
+
+    diagnostics.push(
+      "WatchPage: found transcript params, calling get_transcript"
+    );
+
+    // Call the get_transcript innertube endpoint
+    const transcriptRes = await fetch(
+      "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...YT_HEADERS,
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: "WEB",
+              clientVersion: "2.20240313.05.00",
+              hl: "en",
+              gl: "US",
+            },
+          },
+          params: transcriptParams,
+        }),
+      }
+    );
+
+    if (!transcriptRes.ok) {
+      diagnostics.push(
+        `WatchPage: get_transcript HTTP ${transcriptRes.status}`
+      );
+      return null;
+    }
+
+    const transcriptData = await transcriptRes.json();
+
+    // Extract text from the transcript response - try multiple known structures
+    const segments =
+      transcriptData?.actions?.[0]?.updateEngagementPanelAction?.content
+        ?.transcriptRenderer?.content?.transcriptSearchPanelRenderer?.body
+        ?.transcriptSegmentListRenderer?.initialSegments ||
+      transcriptData?.actions?.[0]?.updateEngagementPanelAction?.content
+        ?.transcriptRenderer?.body?.transcriptBodyRenderer
+        ?.transcriptSegmentListRenderer?.initialSegments ||
+      [];
+
+    if (segments.length > 0) {
+      const text = segments
+        .map(
+          (seg: {
+            transcriptSegmentRenderer?: {
+              snippet?: { runs?: Array<{ text?: string }> };
+            };
+          }) => {
+            const runs =
+              seg?.transcriptSegmentRenderer?.snippet?.runs || [];
+            return runs
+              .map((r: { text?: string }) => r.text || "")
+              .join("");
+          }
+        )
+        .filter(Boolean)
+        .join(" ");
+
+      if (text.trim()) {
+        diagnostics.push(
+          `WatchPage: get_transcript success (${text.length} chars)`
+        );
+        return text;
+      }
+    }
+
+    // Fallback: regex-extract transcript segments from the response JSON string
+    const bodyStr = JSON.stringify(transcriptData);
+    const snippets: string[] = [];
+    const snippetRegex =
+      /"transcriptSegmentRenderer"[^}]*"snippet"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([^"]+)"/g;
+    let m;
+    while ((m = snippetRegex.exec(bodyStr)) !== null) {
+      snippets.push(m[1]);
+    }
+    if (snippets.length > 0) {
+      diagnostics.push(
+        `WatchPage: get_transcript regex got ${snippets.length} segments`
+      );
+      return snippets.join(" ");
+    }
+
+    diagnostics.push("WatchPage: get_transcript returned no usable segments");
+    return null;
+  } catch (e) {
+    diagnostics.push(
+      `WatchPage: error: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return null;
+  }
+}
+
+// Strategy B: Try the timedtext list API directly to discover caption tracks,
+// then fetch the captions XML.
+async function fetchTranscriptViaTimedText(
+  videoId: string
+): Promise<string | null> {
+  try {
+    // First get the list of available caption tracks
+    const listRes = await fetch(
+      `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`,
+      { headers: YT_HEADERS }
+    );
+
+    if (!listRes.ok) {
+      diagnostics.push(`TimedText: list HTTP ${listRes.status}`);
+      return null;
+    }
+
+    const listXml = await listRes.text();
+    diagnostics.push(`TimedText: list got ${listXml.length} chars`);
+
+    // Parse available tracks from XML
+    const trackMatches = [...listXml.matchAll(/lang_code="([^"]+)"/g)];
+
+    if (trackMatches.length === 0) {
+      diagnostics.push("TimedText: no tracks found in list");
+
+      // Try fetching English directly anyway
+      const directRes = await fetch(
+        `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv3`,
+        { headers: YT_HEADERS }
+      );
+      if (directRes.ok) {
+        const xml = await directRes.text();
+        if (xml.includes("<text")) {
+          diagnostics.push("TimedText: direct en fetch worked");
+          return parseXmlTranscript(xml);
+        }
+      }
+
+      // Also try auto-generated captions
+      const autoRes = await fetch(
+        `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&kind=asr&fmt=srv3`,
+        { headers: YT_HEADERS }
+      );
+      if (autoRes.ok) {
+        const xml = await autoRes.text();
+        if (xml.includes("<text")) {
+          diagnostics.push("TimedText: auto-generated en fetch worked");
+          return parseXmlTranscript(xml);
+        }
+      }
+
+      diagnostics.push("TimedText: direct fetches also failed");
+      return null;
+    }
+
+    // Find English track, or use first available
+    const langs = trackMatches.map((m) => m[1]);
+    diagnostics.push(`TimedText: found langs: ${langs.join(", ")}`);
+    const lang =
+      langs.find((l) => l === "en" || l.startsWith("en")) || langs[0];
+
+    // Check for name attribute
+    const nameMatch = listXml.match(
+      new RegExp(`lang_code="${lang}"[^>]*name="([^"]*)"`, "i")
+    );
+    const name = nameMatch ? nameMatch[1] : "";
+
+    const captionRes = await fetch(
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${lang}&name=${encodeURIComponent(name)}&fmt=srv3`,
+      { headers: YT_HEADERS }
+    );
+
+    if (!captionRes.ok) {
+      diagnostics.push(`TimedText: caption fetch HTTP ${captionRes.status}`);
+      return null;
+    }
+
+    const xml = await captionRes.text();
+    if (!xml.includes("<text")) {
+      diagnostics.push("TimedText: caption response has no <text> elements");
+      return null;
+    }
+
+    diagnostics.push("TimedText: success");
+    return parseXmlTranscript(xml);
+  } catch (e) {
+    diagnostics.push(
+      `TimedText: error: ${e instanceof Error ? e.message : "unknown"}`
+    );
+    return null;
+  }
+}
+
+// Strategy C: Use innertube player API to get caption URLs
+async function fetchTranscriptViaInnertube(
+  videoId: string
+): Promise<string | null> {
+  const clients = [
+    {
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+    },
+    {
+      clientName: "WEB",
+      clientVersion: "2.20240313.05.00",
+    },
+  ];
+
+  for (const clientConfig of clients) {
+    try {
+      const res = await fetch(
+        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...YT_HEADERS,
+          },
+          body: JSON.stringify({
+            videoId,
+            context: {
+              client: { ...clientConfig, hl: "en", gl: "US" },
+            },
+          }),
+        }
+      );
+
+      if (!res.ok) {
+        diagnostics.push(
+          `Innertube ${clientConfig.clientName}: HTTP ${res.status}`
+        );
+        continue;
+      }
+
+      const data = await res.json();
+      const tracks =
+        data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+      if (!tracks || tracks.length === 0) {
+        diagnostics.push(
+          `Innertube ${clientConfig.clientName}: no caption tracks`
+        );
+        continue;
+      }
+
+      const enTrack = tracks.find(
+        (t: { languageCode: string }) =>
+          t.languageCode === "en" || t.languageCode?.startsWith("en")
+      );
+      const captionUrl = (enTrack || tracks[0]).baseUrl;
+      if (!captionUrl) continue;
+
+      const captionRes = await fetch(captionUrl);
+      if (!captionRes.ok) continue;
+
+      diagnostics.push(
+        `Innertube ${clientConfig.clientName}: got captions`
+      );
+      return parseXmlTranscript(await captionRes.text());
+    } catch (e) {
+      diagnostics.push(
+        `Innertube ${clientConfig.clientName}: ${e instanceof Error ? e.message : "unknown"}`
       );
     }
   }
 
-  throw new Error("Transcription timed out");
+  return null;
 }
 
 async function fetchTranscript(videoId: string): Promise<string> {
-  const player = await fetchPlayerData(videoId);
+  diagnostics.length = 0;
 
-  // Check if video is playable
-  if (
-    player.playabilityStatus?.status === "ERROR" ||
-    player.playabilityStatus?.status === "UNPLAYABLE"
-  ) {
-    throw new Error(
-      player.playabilityStatus.reason || "Video is not available"
-    );
-  }
+  // Strategy A: Watch page -> ytInitialData -> get_transcript endpoint
+  const fromWatchPage = await fetchTranscriptViaWatchPage(videoId);
+  if (fromWatchPage) return fromWatchPage;
 
-  // Strategy 1: Try YouTube's existing captions (fast, free)
-  const captionUrl = extractCaptionUrl(player);
-  if (captionUrl) {
-    try {
-      return await fetchCaptionsFromUrl(captionUrl);
-    } catch {
-      // Fall through to audio transcription
-    }
-  }
+  // Strategy B: Direct timedtext API
+  const fromTimedText = await fetchTranscriptViaTimedText(videoId);
+  if (fromTimedText) return fromTimedText;
 
-  // Strategy 2: Extract audio stream URL and transcribe with AssemblyAI
-  const audioUrl = extractAudioStreamUrl(player);
-  if (!audioUrl) {
-    throw new Error(
-      "Could not find captions or audio stream for this video"
-    );
-  }
+  // Strategy C: Innertube player API (least likely to work from datacenter IPs)
+  const fromInnertube = await fetchTranscriptViaInnertube(videoId);
+  if (fromInnertube) return fromInnertube;
 
-  return transcribeWithAssemblyAI(audioUrl);
+  throw new Error(
+    "Could not retrieve transcript. Debug: " + diagnostics.join(" | ")
+  );
 }
 
 const SYSTEM_PROMPT = `You are an expert podcast and video summarizer. Your job is to create a concise, well-structured TLDR summary that someone can read in 2-3 minutes over their morning coffee.
