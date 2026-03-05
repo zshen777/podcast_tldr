@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { Innertube } from "youtubei.js";
 import Anthropic from "@anthropic-ai/sdk";
 
 function extractVideoId(url: string): string | null {
@@ -17,19 +16,92 @@ function extractVideoId(url: string): string | null {
 }
 
 async function fetchTranscript(videoId: string): Promise<string> {
-  const innertube = await Innertube.create();
-  const videoInfo = await innertube.getInfo(videoId);
-  const transcriptInfo = await videoInfo.getTranscript();
+  // Fetch the YouTube watch page to extract captions info
+  const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  const res = await fetch(watchUrl, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
 
-  const segments =
-    transcriptInfo.transcript.content?.body?.initial_segments || [];
+  if (!res.ok) {
+    throw new Error(`Failed to fetch YouTube page (status ${res.status})`);
+  }
 
-  const text = segments
+  const html = await res.text();
+
+  // Extract captions data from the embedded player response
+  // Find the captions JSON object by matching braces
+  const captionsMarker = '"captions":';
+  const markerIdx = html.indexOf(captionsMarker);
+  if (markerIdx === -1) {
+    throw new Error("No captions available for this video");
+  }
+
+  const startIdx = markerIdx + captionsMarker.length;
+  let braceCount = 0;
+  let endIdx = startIdx;
+  for (let i = startIdx; i < html.length; i++) {
+    if (html[i] === "{") braceCount++;
+    if (html[i] === "}") braceCount--;
+    if (braceCount === 0) {
+      endIdx = i + 1;
+      break;
+    }
+  }
+  const captionsJson = html.slice(startIdx, endIdx);
+
+  const captions = JSON.parse(captionsJson);
+  const tracks =
+    captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+  if (!tracks || tracks.length === 0) {
+    throw new Error("No caption tracks found for this video");
+  }
+
+  // Prefer English, fall back to first available track
+  const englishTrack = tracks.find(
+    (t: { languageCode: string }) =>
+      t.languageCode === "en" || t.languageCode?.startsWith("en")
+  );
+  const track = englishTrack || tracks[0];
+  const captionUrl = track.baseUrl;
+
+  if (!captionUrl) {
+    throw new Error("No caption URL found");
+  }
+
+  // Fetch the actual captions XML
+  const captionRes = await fetch(captionUrl);
+  if (!captionRes.ok) {
+    throw new Error(`Failed to fetch captions (status ${captionRes.status})`);
+  }
+
+  const xml = await captionRes.text();
+
+  // Parse text from XML <text> elements and decode HTML entities
+  const textSegments = xml.match(/<text[^>]*>([\s\S]*?)<\/text>/g);
+  if (!textSegments || textSegments.length === 0) {
+    throw new Error("Transcript is empty");
+  }
+
+  const text = textSegments
     .map((segment) => {
-      // Each segment has a .snippet Text object
-      const snippetText =
-        "snippet" in segment ? String(segment.snippet) : "";
-      return snippetText;
+      const content = segment.replace(/<[^>]+>/g, "");
+      return content
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&#\d+;/g, (match) => {
+          const code = parseInt(match.slice(2, -1));
+          return String.fromCharCode(code);
+        })
+        .trim();
     })
     .filter(Boolean)
     .join(" ");
