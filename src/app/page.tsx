@@ -124,7 +124,7 @@ export default function Home() {
           <div className="mt-8 flex items-center gap-3 text-zinc-500 dark:text-zinc-400">
             <Spinner />
             <span className="text-sm">
-              Fetching transcript from YouTube...
+              Fetching transcript (this may take a minute if audio transcription is needed)...
             </span>
           </div>
         )}

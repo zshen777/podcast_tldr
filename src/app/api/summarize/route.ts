@@ -15,8 +15,39 @@ function extractVideoId(url: string): string | null {
   return null;
 }
 
-async function fetchTranscript(videoId: string): Promise<string> {
-  // Fetch the YouTube watch page to extract captions info
+function extractJsonObject(html: string, marker: string): string | null {
+  const markerIdx = html.indexOf(marker);
+  if (markerIdx === -1) return null;
+
+  const startIdx = markerIdx + marker.length;
+  let braceCount = 0;
+  let endIdx = startIdx;
+  for (let i = startIdx; i < html.length; i++) {
+    if (html[i] === "{") braceCount++;
+    if (html[i] === "}") braceCount--;
+    if (braceCount === 0) {
+      endIdx = i + 1;
+      break;
+    }
+  }
+  return html.slice(startIdx, endIdx);
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&#\d+;/g, (match) => {
+      const code = parseInt(match.slice(2, -1));
+      return String.fromCharCode(code);
+    });
+}
+
+async function fetchYouTubePageHtml(videoId: string): Promise<string> {
   const watchUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const res = await fetch(watchUrl, {
     headers: {
@@ -30,58 +61,38 @@ async function fetchTranscript(videoId: string): Promise<string> {
     throw new Error(`Failed to fetch YouTube page (status ${res.status})`);
   }
 
-  const html = await res.text();
+  return res.text();
+}
 
-  // Extract captions data from the embedded player response
-  // Find the captions JSON object by matching braces
-  const captionsMarker = '"captions":';
-  const markerIdx = html.indexOf(captionsMarker);
-  if (markerIdx === -1) {
-    throw new Error("No captions available for this video");
+function tryExtractCaptionsTranscript(html: string): string | null {
+  const captionsJson = extractJsonObject(html, '"captions":');
+  if (!captionsJson) return null;
+
+  try {
+    const captions = JSON.parse(captionsJson);
+    const tracks =
+      captions?.playerCaptionsTracklistRenderer?.captionTracks;
+
+    if (!tracks || tracks.length === 0) return null;
+
+    const englishTrack = tracks.find(
+      (t: { languageCode: string }) =>
+        t.languageCode === "en" || t.languageCode?.startsWith("en")
+    );
+    const track = englishTrack || tracks[0];
+    return track.baseUrl || null;
+  } catch {
+    return null;
   }
+}
 
-  const startIdx = markerIdx + captionsMarker.length;
-  let braceCount = 0;
-  let endIdx = startIdx;
-  for (let i = startIdx; i < html.length; i++) {
-    if (html[i] === "{") braceCount++;
-    if (html[i] === "}") braceCount--;
-    if (braceCount === 0) {
-      endIdx = i + 1;
-      break;
-    }
-  }
-  const captionsJson = html.slice(startIdx, endIdx);
-
-  const captions = JSON.parse(captionsJson);
-  const tracks =
-    captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-  if (!tracks || tracks.length === 0) {
-    throw new Error("No caption tracks found for this video");
-  }
-
-  // Prefer English, fall back to first available track
-  const englishTrack = tracks.find(
-    (t: { languageCode: string }) =>
-      t.languageCode === "en" || t.languageCode?.startsWith("en")
-  );
-  const track = englishTrack || tracks[0];
-  const captionUrl = track.baseUrl;
-
-  if (!captionUrl) {
-    throw new Error("No caption URL found");
-  }
-
-  // Fetch the actual captions XML
+async function fetchCaptionsFromUrl(captionUrl: string): Promise<string> {
   const captionRes = await fetch(captionUrl);
   if (!captionRes.ok) {
     throw new Error(`Failed to fetch captions (status ${captionRes.status})`);
   }
 
   const xml = await captionRes.text();
-
-  // Parse text from XML <text> elements and decode HTML entities
   const textSegments = xml.match(/<text[^>]*>([\s\S]*?)<\/text>/g);
   if (!textSegments || textSegments.length === 0) {
     throw new Error("Transcript is empty");
@@ -90,18 +101,7 @@ async function fetchTranscript(videoId: string): Promise<string> {
   const text = textSegments
     .map((segment) => {
       const content = segment.replace(/<[^>]+>/g, "");
-      return content
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&apos;/g, "'")
-        .replace(/&#\d+;/g, (match) => {
-          const code = parseInt(match.slice(2, -1));
-          return String.fromCharCode(code);
-        })
-        .trim();
+      return decodeHtmlEntities(content).trim();
     })
     .filter(Boolean)
     .join(" ");
@@ -111,6 +111,105 @@ async function fetchTranscript(videoId: string): Promise<string> {
   }
 
   return text;
+}
+
+function extractAudioStreamUrl(html: string): string | null {
+  // Extract adaptiveFormats from YouTube's player response
+  const playerMatch = html.match(/"adaptiveFormats":\s*(\[[\s\S]*?\])/);
+  if (!playerMatch) return null;
+
+  try {
+    const formats = JSON.parse(playerMatch[1]);
+    // Find an audio-only format (prefer mp4a/webm audio)
+    const audioFormat = formats.find(
+      (f: { mimeType?: string; url?: string }) =>
+        f.mimeType?.startsWith("audio/") && f.url
+    );
+    return audioFormat?.url || null;
+  } catch {
+    return null;
+  }
+}
+
+async function transcribeWithAssemblyAI(audioUrl: string): Promise<string> {
+  const apiKey = process.env.ASSEMBLYAI_API_KEY;
+  if (!apiKey) {
+    throw new Error(
+      "No captions available and ASSEMBLYAI_API_KEY is not configured for audio transcription fallback."
+    );
+  }
+
+  // Submit transcription job
+  const submitRes = await fetch("https://api.assemblyai.com/v2/transcript", {
+    method: "POST",
+    headers: {
+      Authorization: apiKey,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ audio_url: audioUrl }),
+  });
+
+  if (!submitRes.ok) {
+    throw new Error(
+      `AssemblyAI submission failed (status ${submitRes.status})`
+    );
+  }
+
+  const { id } = await submitRes.json();
+
+  // Poll for completion (max ~5 minutes)
+  const pollUrl = `https://api.assemblyai.com/v2/transcript/${id}`;
+  const maxAttempts = 60;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+
+    const pollRes = await fetch(pollUrl, {
+      headers: { Authorization: apiKey },
+    });
+
+    if (!pollRes.ok) continue;
+
+    const result = await pollRes.json();
+
+    if (result.status === "completed") {
+      if (!result.text?.trim()) {
+        throw new Error("Transcription returned empty text");
+      }
+      return result.text;
+    }
+
+    if (result.status === "error") {
+      throw new Error(
+        `Transcription failed: ${result.error || "unknown error"}`
+      );
+    }
+  }
+
+  throw new Error("Transcription timed out");
+}
+
+async function fetchTranscript(videoId: string): Promise<string> {
+  const html = await fetchYouTubePageHtml(videoId);
+
+  // Strategy 1: Try YouTube's existing captions (fast, free)
+  const captionUrl = tryExtractCaptionsTranscript(html);
+  if (captionUrl) {
+    try {
+      return await fetchCaptionsFromUrl(captionUrl);
+    } catch {
+      // Fall through to audio transcription
+    }
+  }
+
+  // Strategy 2: Extract audio stream URL and transcribe with AssemblyAI
+  const audioUrl = extractAudioStreamUrl(html);
+  if (!audioUrl) {
+    throw new Error(
+      "Could not find captions or audio stream for this video"
+    );
+  }
+
+  return transcribeWithAssemblyAI(audioUrl);
 }
 
 const SYSTEM_PROMPT = `You are an expert podcast and video summarizer. Your job is to create a concise, well-structured TLDR summary that someone can read in 2-3 minutes over their morning coffee.
@@ -172,7 +271,7 @@ export async function POST(request: NextRequest) {
         err instanceof Error ? err.message : "Unknown error";
       return NextResponse.json(
         {
-          error: `Could not fetch transcript: ${detail}. The video may not have captions available.`,
+          error: `Could not fetch transcript: ${detail}`,
         },
         { status: 422 }
       );
