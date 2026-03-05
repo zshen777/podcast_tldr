@@ -50,37 +50,133 @@ interface PlayerResponse {
   };
 }
 
-async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
-  // Use YouTube's innertube player API directly — much more reliable
-  // from server/serverless environments than scraping the watch page
-  const res = await fetch(
-    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: "WEB",
-            clientVersion: "2.20240313.05.00",
-            hl: "en",
-            gl: "US",
-          },
+// Strategy A: Fetch the watch page HTML with consent-bypass cookies
+// and extract the embedded ytInitialPlayerResponse
+async function fetchPlayerFromWatchPage(
+  videoId: string
+): Promise<PlayerResponse | null> {
+  try {
+    const res = await fetch(
+      `https://www.youtube.com/watch?v=${videoId}&hl=en`,
+      {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Accept-Language": "en-US,en;q=0.9",
+          Cookie:
+            "SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjMwODI5LjA3X3AxGgJlbiACGgYIgJnOlwY; CONSENT=PENDING+999",
         },
-      }),
-    }
-  );
+      }
+    );
 
-  if (!res.ok) {
-    throw new Error(`YouTube player API returned status ${res.status}`);
+    if (!res.ok) return null;
+
+    const html = await res.text();
+
+    // Extract ytInitialPlayerResponse from the page
+    const match = html.match(
+      /var ytInitialPlayerResponse\s*=\s*(\{.+?\});/
+    );
+    if (match) {
+      return JSON.parse(match[1]);
+    }
+
+    // Alternative: look for it inside ytInitialData or script tags
+    const altMatch = html.match(
+      /ytInitialPlayerResponse\s*=\s*(\{.+?\});/
+    );
+    if (altMatch) {
+      return JSON.parse(altMatch[1]);
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Strategy B: Use innertube player API with different client types
+async function fetchPlayerFromInnertubeApi(
+  videoId: string
+): Promise<PlayerResponse | null> {
+  const clients = [
+    {
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+    },
+    {
+      clientName: "ANDROID",
+      clientVersion: "19.09.37",
+      androidSdkVersion: 30,
+    },
+    {
+      clientName: "IOS",
+      clientVersion: "19.09.3",
+    },
+    {
+      clientName: "WEB",
+      clientVersion: "2.20240313.05.00",
+    },
+  ];
+
+  for (const clientConfig of clients) {
+    try {
+      const res = await fetch(
+        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          },
+          body: JSON.stringify({
+            videoId,
+            context: {
+              client: {
+                ...clientConfig,
+                hl: "en",
+                gl: "US",
+              },
+            },
+          }),
+        }
+      );
+
+      if (!res.ok) continue;
+
+      const data: PlayerResponse = await res.json();
+
+      // Check if we got useful data (captions or streaming data)
+      const hasCaptions =
+        (data.captions?.playerCaptionsTracklistRenderer?.captionTracks
+          ?.length ?? 0) > 0;
+      const hasStreaming =
+        (data.streamingData?.adaptiveFormats?.length ?? 0) > 0;
+
+      if (hasCaptions || hasStreaming) {
+        return data;
+      }
+    } catch {
+      continue;
+    }
   }
 
-  return res.json();
+  return null;
+}
+
+async function fetchPlayerData(videoId: string): Promise<PlayerResponse> {
+  // Try watch page first (most reliable for getting captions)
+  const fromPage = await fetchPlayerFromWatchPage(videoId);
+  if (fromPage) return fromPage;
+
+  // Try innertube API with various clients
+  const fromApi = await fetchPlayerFromInnertubeApi(videoId);
+  if (fromApi) return fromApi;
+
+  throw new Error(
+    "Could not retrieve video data from YouTube. The video may be private, age-restricted, or unavailable."
+  );
 }
 
 function extractCaptionUrl(player: PlayerResponse): string | null {
